@@ -23,7 +23,7 @@ const (
 	scale        = 127
 	ambigMin     = 3
 	ambigMax     = 19
-	ivfClusters  = 2048
+	ivfClusters  = 256
 	scoreBuckets = 23
 	maxProbe     = 16
 	maxDist      = 1<<63 - 1

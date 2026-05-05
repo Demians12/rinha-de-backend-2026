@@ -18,7 +18,7 @@ const (
 	scale        = 127
 	ambigMin     = 3
 	ambigMax     = 19
-	ivfClusters  = 2048
+	ivfClusters  = 256
 	scoreBuckets = 23
 )
 
