@@ -181,7 +181,7 @@ n = len(lats)
 print(f"""
   ┌───────────────────────────────────────────┐
   │  HTTP over UDS — keep-alive — {N} reqs     │
-  │  Índice: refs ambíguas do exemplo         │
+  │  Índice: refs do exemplo em IVF int8      │
   ├───────────────────────────────────────────┤
   │  mean    {sum(lats)/n:>7.3f} ms                    │
   │  p50     {lats[n//2]:>7.3f} ms                    │

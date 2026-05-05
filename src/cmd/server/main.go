@@ -4,7 +4,6 @@ package main
 import (
 	"encoding/binary"
 	"log"
-	"math"
 	"net"
 	"os"
 	"strconv"
@@ -18,31 +17,42 @@ import (
 )
 
 const (
-	D        = 14
-	vecD     = 16
-	K        = 5
-	scale    = 10000
-	ambigMin = 4
-	ambigMax = 17
+	D           = 14
+	vecD        = 16
+	K           = 5
+	scale       = 127
+	ambigMin    = 4
+	ambigMax    = 17
+	ivfClusters = 256
+	maxProbe    = 16
+	maxDist     = 1<<63 - 1
 )
 
 var (
-	mmapData []byte
-	indexN   int
-	idxVecs  []int16
-	idxLabs  []uint8
+	mmapData     []byte
+	indexN       int
+	indexK       int
+	idxCentroids []int16
+	idxBBoxMin   []int8
+	idxBBoxMax   []int8
+	idxOffsets   []uint32
+	idxVecs      []int8
+	idxLabs      []uint8
+	idxIDs       []uint32
+	ivfNProbe    = 1
+	ivfRepair    = true
 )
 
-type vec16 [vecD]int16
+type vec16 [vecD]int8
 
-func q01(x float64) int16 {
+func q01(x float64) int8 {
 	if x <= 0 {
 		return 0
 	}
 	if x >= 1 {
 		return scale
 	}
-	return int16(math.Round(x * scale))
+	return int8(x*scale + 0.5)
 }
 
 func daysFromCivil(y, m, d int) int {
@@ -81,98 +91,115 @@ func parseRFC3339Parts(s string) (hour, dow, epochMinute int, ok bool) {
 	return h, (days + 3) % 7, days*1440 + h*60 + mi, true
 }
 
-func ruleScore(v *vec16) int {
-	score := 0
-	if v[0] >= 2000 {
-		score++
-	}
-	if v[0] >= 500 {
-		score++
-	}
-	if v[1] >= 5000 {
-		score++
-	}
-	if v[1] >= 3333 {
-		score++
-	}
-	if v[3] < 3043 {
-		score++
-	}
-	if v[3] < 3478 || v[3] >= 9130 {
-		score++
-	}
-	if v[2] >= 8000 {
-		score++
-	}
-	if v[2] >= 1000 {
-		score++
-	}
-	if v[8] >= 4000 {
-		score++
-	}
-	if v[8] >= 3000 {
-		score++
-	}
-	if v[11] >= 5000 {
-		score++
-	}
-	if v[12] >= 7500 {
-		score++
-	}
-	if v[12] >= 4500 {
-		score++
-	}
-	if v[9] >= 5000 {
-		score++
-	}
-	if v[10] < 5000 {
-		score++
-	}
-	if v[7] >= 2000 {
-		score++
-	}
-	if v[7] >= 500 {
-		score++
-	}
-	if v[5] >= 0 && v[5] <= 69 {
-		score++
-	}
-	if v[5] >= 0 && v[5] <= 208 {
-		score++
-	}
-	if v[6] >= 2000 {
-		score++
-	}
-	if v[6] >= 200 {
-		score++
-	}
-	if v[13] <= 100 {
-		score++
-	}
-	return score
+func betterPair(d int64, id uint32, bestD int64, bestID uint32) bool {
+	return d < bestD || (d == bestD && id < bestID)
 }
 
-func insertTopK(best *[K]int64, labels *[K]uint8, d int64, label uint8) {
-	if d >= best[K-1] {
+func insertTopK(best *[K]int64, labels *[K]uint8, ids *[K]uint32, d int64, label uint8, id uint32) {
+	if !betterPair(d, id, best[K-1], ids[K-1]) {
 		return
 	}
 	pos := K - 1
-	for pos > 0 && d < best[pos-1] {
+	for pos > 0 && betterPair(d, id, best[pos-1], ids[pos-1]) {
 		best[pos] = best[pos-1]
 		labels[pos] = labels[pos-1]
+		ids[pos] = ids[pos-1]
 		pos--
 	}
 	best[pos] = d
 	labels[pos] = label
+	ids[pos] = id
+}
+
+func insertProbe(bestC *[maxProbe]int, bestD *[maxProbe]int64, nprobe int, c int, d int64) {
+	if d >= bestD[nprobe-1] {
+		return
+	}
+	pos := nprobe - 1
+	for pos > 0 && d < bestD[pos-1] {
+		bestD[pos] = bestD[pos-1]
+		bestC[pos] = bestC[pos-1]
+		pos--
+	}
+	bestD[pos] = d
+	bestC[pos] = c
+}
+
+func centroidDist(q *vec16, c int) int64 {
+	offset := c * vecD
+	var sum int64
+	for i := 0; i < vecD; i++ {
+		d := int64(q[i]) - int64(idxCentroids[offset+i])
+		sum += d * d
+	}
+	return sum
+}
+
+func bboxLowerBound(q *vec16, c int) int64 {
+	offset := c * vecD
+	var sum int64
+	for i := 0; i < vecD; i++ {
+		x := q[i]
+		var d int64
+		if x < idxBBoxMin[offset+i] {
+			d = int64(idxBBoxMin[offset+i]) - int64(x)
+		} else if x > idxBBoxMax[offset+i] {
+			d = int64(x) - int64(idxBBoxMax[offset+i])
+		}
+		sum += d * d
+	}
+	return sum
+}
+
+func scanRange(q *vec16, start, end int, best *[K]int64, labels *[K]uint8, ids *[K]uint32) {
+	for i := start; i < end; i++ {
+		ref := (*vec16)(unsafe.Pointer(&idxVecs[i*vecD]))
+		insertTopK(best, labels, ids, dist2(q, ref), idxLabs[i], idxIDs[i])
+	}
 }
 
 func knnSearch(q *vec16) (fraudCount int) {
-	best := [K]int64{math.MaxInt64, math.MaxInt64, math.MaxInt64, math.MaxInt64, math.MaxInt64}
+	best := [K]int64{maxDist, maxDist, maxDist, maxDist, maxDist}
+	ids := [K]uint32{^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0)}
 	var labels [K]uint8
-	for i := 0; i < indexN; i++ {
-		ref := (*vec16)(unsafe.Pointer(&idxVecs[i*vecD]))
-		insertTopK(&best, &labels, dist2(q, ref), idxLabs[i])
+	nprobe := ivfNProbe
+	if nprobe > indexK {
+		nprobe = indexK
 	}
+	if nprobe < 1 {
+		nprobe = 1
+	}
+
+	bestC := [maxProbe]int{}
+	bestCD := [maxProbe]int64{}
+	for i := 0; i < nprobe; i++ {
+		bestC[i] = -1
+		bestCD[i] = maxDist
+	}
+	for c := 0; c < indexK; c++ {
+		insertProbe(&bestC, &bestCD, nprobe, c, centroidDist(q, c))
+	}
+
+	var scanned [ivfClusters]bool
+	for i := 0; i < nprobe; i++ {
+		c := bestC[i]
+		if c < 0 {
+			continue
+		}
+		scanned[c] = true
+		scanRange(q, int(idxOffsets[c]), int(idxOffsets[c+1]), &best, &labels, &ids)
+	}
+	if ivfRepair {
+		for c := 0; c < indexK; c++ {
+			if scanned[c] || idxOffsets[c] == idxOffsets[c+1] {
+				continue
+			}
+			if bboxLowerBound(q, c) <= best[K-1] {
+				scanRange(q, int(idxOffsets[c]), int(idxOffsets[c+1]), &best, &labels, &ids)
+			}
+		}
+	}
+
 	for i := 0; i < K; i++ {
 		if labels[i] == 1 {
 			fraudCount++
@@ -189,7 +216,7 @@ var (
 	maxKm           = 1000.0
 	maxTx24h        = 20.0
 	maxMerchantAmt  = 10000.0
-	mccRisk         [10000]int16
+	mccRisk         [10000]int8
 )
 
 func mccIdx(s string) int {
@@ -239,12 +266,36 @@ var payloadPool = sync.Pool{
 	New: func() any { return &Payload{} },
 }
 
-func vectorize(p *Payload, v *vec16) {
-	v[0] = q01(p.Transaction.Amount / maxAmount)
-	v[1] = q01(float64(p.Transaction.Installments) / maxInstallments)
+func vectorize(p *Payload, v *vec16) int {
+	score := 0
+
+	amount := p.Transaction.Amount
+	v[0] = q01(amount / maxAmount)
+	if amount >= 2000 {
+		score++
+	}
+	if amount >= 500 {
+		score++
+	}
+
+	installments := p.Transaction.Installments
+	v[1] = q01(float64(installments) / maxInstallments)
+	if installments >= 6 {
+		score++
+	}
+	if installments >= 4 {
+		score++
+	}
 
 	if p.Customer.AvgAmount > 0 {
-		v[2] = q01((p.Transaction.Amount / p.Customer.AvgAmount) / amtVsAvgRatio)
+		amountVsAvg := amount / p.Customer.AvgAmount
+		v[2] = q01(amountVsAvg / amtVsAvgRatio)
+		if amountVsAvg >= 8 {
+			score++
+		}
+		if amountVsAvg >= 1 {
+			score++
+		}
 	} else {
 		v[2] = 0
 	}
@@ -253,6 +304,12 @@ func vectorize(p *Payload, v *vec16) {
 	if ok {
 		v[3] = q01(float64(hour) / 23.0)
 		v[4] = q01(float64(dow) / 6.0)
+		if hour < 7 {
+			score++
+		}
+		if hour < 8 || hour >= 21 {
+			score++
+		}
 		if p.LastTx != nil {
 			_, _, lastMinute, lastOK := parseRFC3339Parts(p.LastTx.Timestamp)
 			if lastOK {
@@ -261,7 +318,20 @@ func vectorize(p *Payload, v *vec16) {
 					mins = -mins
 				}
 				v[5] = q01(float64(mins) / maxMinutes)
-				v[6] = q01(p.LastTx.KmFromCurrent / maxKm)
+				if mins <= 10 {
+					score++
+				}
+				if mins <= 30 {
+					score++
+				}
+				lastKm := p.LastTx.KmFromCurrent
+				v[6] = q01(lastKm / maxKm)
+				if lastKm >= 200 {
+					score++
+				}
+				if lastKm >= 20 {
+					score++
+				}
 			} else {
 				v[5] = -scale
 				v[6] = -scale
@@ -277,16 +347,34 @@ func vectorize(p *Payload, v *vec16) {
 		v[6] = -scale
 	}
 
-	v[7] = q01(p.Terminal.KmFromHome / maxKm)
-	v[8] = q01(float64(p.Customer.TxCount24h) / maxTx24h)
+	kmFromHome := p.Terminal.KmFromHome
+	v[7] = q01(kmFromHome / maxKm)
+	if kmFromHome >= 200 {
+		score++
+	}
+	if kmFromHome >= 50 {
+		score++
+	}
+
+	txCount24h := p.Customer.TxCount24h
+	v[8] = q01(float64(txCount24h) / maxTx24h)
+	if txCount24h >= 8 {
+		score++
+	}
+	if txCount24h >= 6 {
+		score++
+	}
 
 	v[9] = 0
 	if p.Terminal.IsOnline {
 		v[9] = scale
+		score++
 	}
 	v[10] = 0
 	if p.Terminal.CardPresent {
 		v[10] = scale
+	} else {
+		score++
 	}
 
 	known := false
@@ -299,18 +387,31 @@ func vectorize(p *Payload, v *vec16) {
 	v[11] = 0
 	if !known {
 		v[11] = scale
+		score++
 	}
 
+	mccRiskVal := int8((scale + 1) / 2)
 	if idx := mccIdx(p.Merchant.MCC); idx >= 0 {
-		v[12] = mccRisk[idx]
-	} else {
-		v[12] = 5000
+		mccRiskVal = mccRisk[idx]
+	}
+	v[12] = mccRiskVal
+	if mccRiskVal >= 95 {
+		score++
+	}
+	if mccRiskVal >= 57 {
+		score++
 	}
 
-	v[13] = q01(p.Merchant.AvgAmount / maxMerchantAmt)
+	merchantAvg := p.Merchant.AvgAmount
+	v[13] = q01(merchantAvg / maxMerchantAmt)
+	if merchantAvg <= 100 {
+		score++
+	}
 
 	v[14] = 0
 	v[15] = 0
+
+	return score
 }
 
 var json2 = jsoniter.ConfigCompatibleWithStandardLibrary
@@ -341,8 +442,7 @@ func fraudHandler(ctx *fasthttp.RequestCtx) {
 	}
 
 	var v vec16
-	vectorize(p, &v)
-	score := ruleScore(&v)
+	score := vectorize(p, &v)
 
 	var fraudCount int
 	if score < ambigMin {
@@ -355,6 +455,24 @@ func fraudHandler(ctx *fasthttp.RequestCtx) {
 
 	ctx.SetContentTypeBytes(ctJSON)
 	ctx.SetBody(responses[fraudCount])
+}
+
+func envInt(name string, def, min, max int) int {
+	s := os.Getenv(name)
+	if s == "" {
+		return def
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return def
+	}
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
 }
 
 func loadIndex(path string) error {
@@ -375,25 +493,59 @@ func loadIndex(path string) error {
 		return err
 	}
 
-	if len(mmapData) < 12 || string(mmapData[0:4]) != "RKN4" {
+	if len(mmapData) < 20 || string(mmapData[0:4]) != "RIV1" {
 		log.Fatal("index.bin: wrong magic")
 	}
 	indexN = int(binary.LittleEndian.Uint32(mmapData[4:8]))
-	dims := int(binary.LittleEndian.Uint32(mmapData[8:12]))
+	indexK = int(binary.LittleEndian.Uint32(mmapData[8:12]))
+	dims := int(binary.LittleEndian.Uint32(mmapData[12:16]))
+	indexScale := int(binary.LittleEndian.Uint32(mmapData[16:20]))
 	if dims != vecD {
 		log.Fatalf("index.bin: wrong dimension %d (want %d)", dims, vecD)
 	}
+	if indexScale != scale {
+		log.Fatalf("index.bin: wrong scale %d (want %d)", indexScale, scale)
+	}
+	if indexK < 1 || indexK > ivfClusters {
+		log.Fatalf("index.bin: wrong cluster count %d", indexK)
+	}
 
-	offset := 12
-	vecBytes := indexN * vecD * 2
-	idxVecs = unsafe.Slice((*int16)(unsafe.Pointer(&mmapData[offset])), indexN*vecD)
+	centroidBytes := indexK * vecD * 2
+	bboxBytes := indexK * vecD
+	offsetBytes := (indexK + 1) * 4
+	vecBytes := indexN * vecD
+	labelBytes := indexN
+	idPad := (4 - (labelBytes & 3)) & 3
+	idBytes := indexN * 4
+	expected := 20 + centroidBytes + bboxBytes*2 + offsetBytes + vecBytes + labelBytes + idPad + idBytes
+	if len(mmapData) < expected {
+		log.Fatalf("index.bin: truncated: got %d bytes, want at least %d", len(mmapData), expected)
+	}
+
+	offset := 20
+	idxCentroids = unsafe.Slice((*int16)(unsafe.Pointer(&mmapData[offset])), indexK*vecD)
+	offset += centroidBytes
+	idxBBoxMin = unsafe.Slice((*int8)(unsafe.Pointer(&mmapData[offset])), indexK*vecD)
+	offset += bboxBytes
+	idxBBoxMax = unsafe.Slice((*int8)(unsafe.Pointer(&mmapData[offset])), indexK*vecD)
+	offset += bboxBytes
+	idxOffsets = unsafe.Slice((*uint32)(unsafe.Pointer(&mmapData[offset])), indexK+1)
+	offset += offsetBytes
+	idxVecs = unsafe.Slice((*int8)(unsafe.Pointer(&mmapData[offset])), indexN*vecD)
 	offset += vecBytes
 	idxLabs = mmapData[offset : offset+indexN]
+	offset += labelBytes + idPad
+	idxIDs = unsafe.Slice((*uint32)(unsafe.Pointer(&mmapData[offset])), indexN)
 
 	return nil
 }
 
 func loadMCCRisk(path string) error {
+	defaultRisk := int8((scale + 1) / 2)
+	for i := range mccRisk {
+		mccRisk[i] = defaultRisk
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -410,14 +562,14 @@ func loadMCCRisk(path string) error {
 		if err != nil || n < 0 || n >= 10000 {
 			continue
 		}
-		val := int16(math.Round(v * scale))
+		val := int(v*scale + 0.5)
 		if val < 0 {
 			val = 0
 		}
 		if val > scale {
 			val = scale
 		}
-		mccRisk[n] = val
+		mccRisk[n] = int8(val)
 	}
 	return nil
 }
@@ -442,7 +594,9 @@ func main() {
 	if err := loadIndex(indexPath); err != nil {
 		log.Fatalf("load index: %v", err)
 	}
-	log.Printf("Index loaded: ambiguous refs=%d", indexN)
+	ivfNProbe = envInt("IVF_NPROBE", 1, 1, maxProbe)
+	ivfRepair = envInt("IVF_REPAIR", 1, 0, 1) != 0
+	log.Printf("Index loaded: refs=%d clusters=%d nprobe=%d repair=%t", indexN, indexK, ivfNProbe, ivfRepair)
 
 	os.Remove(udsPath)
 

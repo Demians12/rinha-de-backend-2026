@@ -8,10 +8,12 @@ x-api-common: &api-common
     nofile:
       soft: 65535
       hard: 65535
+  cpus: "0.40"
+  mem_limit: "150MB"
   deploy:
     resources:
       limits:
-        cpus: "0.45"
+        cpus: "0.40"
         memory: "150MB"
 
 services:
@@ -25,6 +27,8 @@ services:
       - rinha-sockets:/sockets
     networks:
       - rinha-net
+    cpus: "0.20"
+    mem_limit: "50MB"
     depends_on:
       api1:
         condition: service_healthy
@@ -33,7 +37,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.10"
+          cpus: "0.20"
           memory: "50MB"
 
   api1:
@@ -44,6 +48,8 @@ services:
       UDS_PATH: "/sockets/api1.sock"
       INDEX_PATH: "/app/resources/index.bin"
       MCC_RISK_PATH: "/app/resources/mcc_risk.json"
+      IVF_NPROBE: "1"
+      IVF_REPAIR: "1"
       GOGC: "off"
       GOMEMLIMIT: "140MiB"
       GOMAXPROCS: "1"
@@ -61,6 +67,8 @@ services:
       UDS_PATH: "/sockets/api2.sock"
       INDEX_PATH: "/app/resources/index.bin"
       MCC_RISK_PATH: "/app/resources/mcc_risk.json"
+      IVF_NPROBE: "1"
+      IVF_REPAIR: "1"
       GOGC: "off"
       GOMEMLIMIT: "140MiB"
       GOMAXPROCS: "1"
