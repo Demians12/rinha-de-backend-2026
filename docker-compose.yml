@@ -1,0 +1,72 @@
+x-api-common: &api-common
+  image: demians/rinha-2026:latest
+  networks:
+    - rinha-net
+  volumes:
+    - rinha-sockets:/sockets
+  ulimits:
+    nofile:
+      soft: 65535
+      hard: 65535
+  deploy:
+    resources:
+      limits:
+        cpus: "0.45"
+        memory: "150MB"
+
+services:
+  haproxy:
+    image: haproxy:3.3
+    container_name: rinha-haproxy
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - rinha-sockets:/sockets
+    networks:
+      - rinha-net
+    depends_on:
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "50MB"
+
+  api1:
+    <<: *api-common
+    container_name: rinha-api1
+    hostname: api1
+    environment:
+      UDS_PATH: "/sockets/api1.sock"
+      INDEX_PATH: "/app/resources/index.bin"
+      MCC_RISK_PATH: "/app/resources/mcc_risk.json"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "/sockets/api1.sock"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  api2:
+    <<: *api-common
+    container_name: rinha-api2
+    hostname: api2
+    environment:
+      UDS_PATH: "/sockets/api2.sock"
+      INDEX_PATH: "/app/resources/index.bin"
+      MCC_RISK_PATH: "/app/resources/mcc_risk.json"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "/sockets/api2.sock"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+networks:
+  rinha-net:
+    driver: bridge
+
+volumes:
+  rinha-sockets:

@@ -4,3 +4,6 @@ resources/references.json
 .env
 test/results.json
 temporary-results
+src/buildindex
+src/server
+src/healthcheck
