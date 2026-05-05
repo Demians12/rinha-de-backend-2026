@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -38,18 +39,21 @@ var (
 	idxThresh []float32
 )
 
-func dequantize(u uint8) float32 {
-	if u == 255 {
-		return -1.0
+// dqTable replaces the dequantize branch with a 1KB L1-resident lookup.
+var dqTable [256]float32
+
+func init() {
+	for i := 0; i < 255; i++ {
+		dqTable[i] = float32(i) / 254.0
 	}
-	return float32(u) / 254.0
+	dqTable[255] = -1.0
 }
 
 func euclidean(q []float32, refIdx int32) float32 {
 	ref := idxVecs[refIdx*D : refIdx*D+D]
 	var sum float32
 	for i := 0; i < D; i++ {
-		d := q[i] - dequantize(ref[i])
+		d := q[i] - dqTable[ref[i]]
 		sum += d * d
 	}
 	return float32(math.Sqrt(float64(sum)))
@@ -72,6 +76,14 @@ func (h *knnHeap) Pop() interface{} {
 	x := old[n-1]
 	*h = old[:n-1]
 	return x
+}
+
+// heapPool eliminates per-request knnHeap allocation.
+var heapPool = sync.Pool{
+	New: func() interface{} {
+		h := make(knnHeap, 0, K+1)
+		return &h
+	},
 }
 
 func vpSearch(nodeIdx int32, q []float32, h *knnHeap, tau float32) float32 {
@@ -111,14 +123,16 @@ func vpSearch(nodeIdx int32, q []float32, h *knnHeap, tau float32) float32 {
 }
 
 func knnSearch(q []float32) (fraudCount, total int) {
-	h := make(knnHeap, 0, K+1)
-	vpSearch(indexRoot, q, &h, math.MaxFloat32)
-	total = h.Len()
-	for _, item := range h {
+	hp := heapPool.Get().(*knnHeap)
+	*hp = (*hp)[:0]
+	vpSearch(indexRoot, q, hp, math.MaxFloat32)
+	total = hp.Len()
+	for _, item := range *hp {
 		if item.label == 1 {
 			fraudCount++
 		}
 	}
+	heapPool.Put(hp)
 	return
 }
 
@@ -171,34 +185,71 @@ type Payload struct {
 	} `json:"last_transaction"`
 }
 
-func vectorize(p *Payload) []float32 {
-	v := make([]float32, D)
+// parseRFC3339HourDOW extracts hour (0-23) and weekday (0=Mon..6=Sun) from a
+// UTC RFC3339 string without calling time.Parse, saving ~500ns on the hot path.
+func parseRFC3339HourDOW(s string) (hour, dow int, ok bool) {
+	if len(s) < 20 {
+		return
+	}
+	y := int(s[0]-'0')*1000 + int(s[1]-'0')*100 + int(s[2]-'0')*10 + int(s[3]-'0')
+	mo := int(s[5]-'0')*10 + int(s[6]-'0')
+	d := int(s[8]-'0')*10 + int(s[9]-'0')
+	h := int(s[11]-'0')*10 + int(s[12]-'0')
+	if mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 {
+		return
+	}
+	// Tomohiko Sakamoto's algorithm — 0=Sunday
+	tab := [12]int{0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4}
+	yy := y
+	if mo < 3 {
+		yy--
+	}
+	w := (yy + yy/4 - yy/100 + yy/400 + tab[mo-1] + d) % 7
+	return h, (w + 6) % 7, true // convert to 0=Monday
+}
 
+// vec14 is a fixed-size feature vector for pool reuse.
+type vec14 [D]float32
+
+// vecPool eliminates per-request []float32 allocation.
+var vecPool = sync.Pool{
+	New: func() interface{} { return new(vec14) },
+}
+
+func vectorize(p *Payload, v []float32) {
 	v[0] = clamp(p.Transaction.Amount/maxAmount, 0, 1)
 	v[1] = clamp(float64(p.Transaction.Installments)/maxInstallments, 0, 1)
 
 	if p.Customer.AvgAmount > 0 {
 		v[2] = clamp((p.Transaction.Amount/p.Customer.AvgAmount)/amtVsAvgRatio, 0, 1)
+	} else {
+		v[2] = 0
 	}
 
-	t, err := time.Parse(time.RFC3339, p.Transaction.RequestedAt)
-	if err == nil {
-		v[3] = float32(t.UTC().Hour()) / 23.0
-		dow := (int(t.UTC().Weekday()) + 6) % 7
+	hour, dow, ok := parseRFC3339HourDOW(p.Transaction.RequestedAt)
+	if ok {
+		v[3] = float32(hour) / 23.0
 		v[4] = float32(dow) / 6.0
 
 		if p.LastTx != nil {
-			lastT, err2 := time.Parse(time.RFC3339, p.LastTx.Timestamp)
-			if err2 == nil {
-				mins := t.Sub(lastT).Minutes()
-				if mins < 0 {
-					mins = -mins
+			// Full parse only when we need to compute a time difference.
+			t, err := time.Parse(time.RFC3339, p.Transaction.RequestedAt)
+			if err == nil {
+				lastT, err2 := time.Parse(time.RFC3339, p.LastTx.Timestamp)
+				if err2 == nil {
+					mins := t.Sub(lastT).Minutes()
+					if mins < 0 {
+						mins = -mins
+					}
+					v[5] = clamp(mins/maxMinutes, 0, 1)
+				} else {
+					v[5] = -1
 				}
-				v[5] = clamp(mins/maxMinutes, 0, 1)
+				v[6] = clamp(p.LastTx.KmFromCurrent/maxKm, 0, 1)
 			} else {
 				v[5] = -1
+				v[6] = -1
 			}
-			v[6] = clamp(p.LastTx.KmFromCurrent/maxKm, 0, 1)
 		} else {
 			v[5] = -1
 			v[6] = -1
@@ -213,9 +264,12 @@ func vectorize(p *Payload) []float32 {
 	v[7] = clamp(p.Terminal.KmFromHome/maxKm, 0, 1)
 	v[8] = clamp(float64(p.Customer.TxCount24h)/maxTx24h, 0, 1)
 
+	// Explicit zeroing required: pooled slices carry values from prior requests.
+	v[9] = 0
 	if p.Terminal.IsOnline {
 		v[9] = 1
 	}
+	v[10] = 0
 	if p.Terminal.CardPresent {
 		v[10] = 1
 	}
@@ -227,6 +281,7 @@ func vectorize(p *Payload) []float32 {
 			break
 		}
 	}
+	v[11] = 0
 	if !known {
 		v[11] = 1
 	}
@@ -238,8 +293,6 @@ func vectorize(p *Payload) []float32 {
 	}
 
 	v[13] = clamp(p.Merchant.AvgAmount/maxMerchantAmt, 0, 1)
-
-	return v
 }
 
 var json2 = jsoniter.ConfigCompatibleWithStandardLibrary
@@ -256,8 +309,10 @@ func fraudHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	vec := vectorize(&p)
-	fraudCount, total := knnSearch(vec)
+	vp := vecPool.Get().(*vec14)
+	vectorize(&p, vp[:])
+	fraudCount, total := knnSearch(vp[:])
+	vecPool.Put(vp)
 
 	var fraudScore float64
 	if total > 0 {
