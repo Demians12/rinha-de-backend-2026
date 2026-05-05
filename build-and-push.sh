@@ -78,15 +78,17 @@ CURRENT_BRANCH=$(git branch --show-current)
 
 git checkout -B submission
 
-# Remove tudo que não é necessário para rodar o teste
-git rm -rf src/ 2>/dev/null || true
-git rm -f test-local.sh build-and-push.sh SETUP.md 2>/dev/null || true
+# Remove tudo e restaura apenas o que o avaliador usa.
+# A documentação exige que a branch submission não contenha código-fonte.
+git rm -r --ignore-unmatch . 2>/dev/null || true
 
-# Adiciona só o necessário
-git add docker-compose.yml
-git add haproxy.cfg
-git add info.json
-git add participants/
+git checkout "${CURRENT_BRANCH}" -- \
+    docker-compose.yml \
+    haproxy.cfg \
+    info.json \
+    participants/Demians12.json
+
+git add docker-compose.yml haproxy.cfg info.json participants/Demians12.json
 
 git commit -m "submission: go rules knn uds $(date +%Y-%m-%d-%H%M)"
 
