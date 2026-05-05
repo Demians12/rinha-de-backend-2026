@@ -129,45 +129,17 @@ func insertProbe(bestC *[maxProbe]int, bestD *[maxProbe]int64, nprobe int, c int
 }
 
 func centroidDist(q *vec16, c int) int64 {
-	offset := c * vecD
-	var sum int64
-	for i := 0; i < vecD; i++ {
-		d := int64(q[i]) - int64(idxCentroids[offset+i])
-		sum += d * d
-	}
-	return sum
+	return centroidDistSIMD(q, &idxCentroids[c*vecD])
 }
 
 func bboxLowerBound(q *vec16, c int) int64 {
-	offset := c * vecD
-	var sum int64
-	for i := 0; i < vecD; i++ {
-		x := q[i]
-		var d int64
-		if x < idxBBoxMin[offset+i] {
-			d = int64(idxBBoxMin[offset+i]) - int64(x)
-		} else if x > idxBBoxMax[offset+i] {
-			d = int64(x) - int64(idxBBoxMax[offset+i])
-		}
-		sum += d * d
-	}
-	return sum
+	off := c * vecD
+	return lboundSIMD(q, &idxBBoxMin[off], &idxBBoxMax[off])
 }
 
 func bucketLowerBound(q *vec16, c, score int) int64 {
-	offset := (c*scoreBuckets + score) * vecD
-	var sum int64
-	for i := 0; i < vecD; i++ {
-		x := q[i]
-		var d int64
-		if x < idxBucketMin[offset+i] {
-			d = int64(idxBucketMin[offset+i]) - int64(x)
-		} else if x > idxBucketMax[offset+i] {
-			d = int64(x) - int64(idxBucketMax[offset+i])
-		}
-		sum += d * d
-	}
-	return sum
+	off := (c*scoreBuckets + score) * vecD
+	return lboundSIMD(q, &idxBucketMin[off], &idxBucketMax[off])
 }
 
 func scanRange(q *vec16, start, end int, best *[K]int64, labels *[K]uint8, ids *[K]uint32) {
