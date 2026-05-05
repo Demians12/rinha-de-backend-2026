@@ -17,15 +17,16 @@ import (
 )
 
 const (
-	D           = 14
-	vecD        = 16
-	K           = 5
-	scale       = 127
-	ambigMin    = 4
-	ambigMax    = 17
-	ivfClusters = 256
-	maxProbe    = 16
-	maxDist     = 1<<63 - 1
+	D            = 14
+	vecD         = 16
+	K            = 5
+	scale        = 127
+	ambigMin     = 3
+	ambigMax     = 19
+	ivfClusters  = 256
+	scoreBuckets = 23
+	maxProbe     = 16
+	maxDist      = 1<<63 - 1
 )
 
 var (
@@ -35,6 +36,8 @@ var (
 	idxCentroids []int16
 	idxBBoxMin   []int8
 	idxBBoxMax   []int8
+	idxBucketMin []int8
+	idxBucketMax []int8
 	idxOffsets   []uint32
 	idxVecs      []int8
 	idxLabs      []uint8
@@ -151,6 +154,22 @@ func bboxLowerBound(q *vec16, c int) int64 {
 	return sum
 }
 
+func bucketLowerBound(q *vec16, c, score int) int64 {
+	offset := (c*scoreBuckets + score) * vecD
+	var sum int64
+	for i := 0; i < vecD; i++ {
+		x := q[i]
+		var d int64
+		if x < idxBucketMin[offset+i] {
+			d = int64(idxBucketMin[offset+i]) - int64(x)
+		} else if x > idxBucketMax[offset+i] {
+			d = int64(x) - int64(idxBucketMax[offset+i])
+		}
+		sum += d * d
+	}
+	return sum
+}
+
 func scanRange(q *vec16, start, end int, best *[K]int64, labels *[K]uint8, ids *[K]uint32) {
 	for i := start; i < end; i++ {
 		ref := (*vec16)(unsafe.Pointer(&idxVecs[i*vecD]))
@@ -158,10 +177,63 @@ func scanRange(q *vec16, start, end int, best *[K]int64, labels *[K]uint8, ids *
 	}
 }
 
-func knnSearch(q *vec16) (fraudCount int) {
-	best := [K]int64{maxDist, maxDist, maxDist, maxDist, maxDist}
-	ids := [K]uint32{^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0)}
-	var labels [K]uint8
+func insertRepairCluster(clusters *[ivfClusters]int, bounds *[ivfClusters]int64, n int, c int, bound int64) int {
+	pos := n
+	for pos > 0 && bound < bounds[pos-1] {
+		bounds[pos] = bounds[pos-1]
+		clusters[pos] = clusters[pos-1]
+		pos--
+	}
+	bounds[pos] = bound
+	clusters[pos] = c
+	return n + 1
+}
+
+func insertScoreBucket(scores *[scoreBuckets]int, bounds *[scoreBuckets]int64, n int, score int, bound int64) int {
+	pos := n
+	for pos > 0 && bound < bounds[pos-1] {
+		bounds[pos] = bounds[pos-1]
+		scores[pos] = scores[pos-1]
+		pos--
+	}
+	bounds[pos] = bound
+	scores[pos] = score
+	return n + 1
+}
+
+func clusterStart(c int) int {
+	return int(idxOffsets[c*(scoreBuckets+1)])
+}
+
+func clusterEnd(c int) int {
+	return int(idxOffsets[c*(scoreBuckets+1)+scoreBuckets])
+}
+
+func scoreBucketStart(c, score int) int {
+	return int(idxOffsets[c*(scoreBuckets+1)+score])
+}
+
+func scoreBucketEnd(c, score int) int {
+	return int(idxOffsets[c*(scoreBuckets+1)+score+1])
+}
+
+func countFrauds(labels *[K]uint8) (fraudCount int) {
+	for i := 0; i < K; i++ {
+		if labels[i] == 1 {
+			fraudCount++
+		}
+	}
+	return fraudCount
+}
+
+func initTopK() ([K]int64, [K]uint8, [K]uint32) {
+	return [K]int64{maxDist, maxDist, maxDist, maxDist, maxDist},
+		[K]uint8{},
+		[K]uint32{^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0)}
+}
+
+func knnTopKIVF(q *vec16) ([K]int64, [K]uint8, [K]uint32) {
+	best, labels, ids := initTopK()
 	nprobe := ivfNProbe
 	if nprobe > indexK {
 		nprobe = indexK
@@ -187,25 +259,56 @@ func knnSearch(q *vec16) (fraudCount int) {
 			continue
 		}
 		scanned[c] = true
-		scanRange(q, int(idxOffsets[c]), int(idxOffsets[c+1]), &best, &labels, &ids)
+		scanRange(q, clusterStart(c), clusterEnd(c), &best, &labels, &ids)
 	}
 	if ivfRepair {
+		var repairC [ivfClusters]int
+		var repairBound [ivfClusters]int64
+		repairN := 0
 		for c := 0; c < indexK; c++ {
-			if scanned[c] || idxOffsets[c] == idxOffsets[c+1] {
+			if scanned[c] || clusterStart(c) == clusterEnd(c) {
 				continue
 			}
-			if bboxLowerBound(q, c) <= best[K-1] {
-				scanRange(q, int(idxOffsets[c]), int(idxOffsets[c+1]), &best, &labels, &ids)
+			bound := bboxLowerBound(q, c)
+			if bound <= best[K-1] {
+				repairN = insertRepairCluster(&repairC, &repairBound, repairN, c, bound)
+			}
+		}
+		for i := 0; i < repairN; i++ {
+			if repairBound[i] > best[K-1] {
+				break
+			}
+			c := repairC[i]
+			var bucketScores [scoreBuckets]int
+			var bucketBounds [scoreBuckets]int64
+			bucketN := 0
+			for score := 0; score < scoreBuckets; score++ {
+				start := scoreBucketStart(c, score)
+				end := scoreBucketEnd(c, score)
+				if start == end {
+					continue
+				}
+				bound := bucketLowerBound(q, c, score)
+				if bound <= best[K-1] {
+					bucketN = insertScoreBucket(&bucketScores, &bucketBounds, bucketN, score, bound)
+				}
+			}
+			for j := 0; j < bucketN; j++ {
+				if bucketBounds[j] > best[K-1] {
+					break
+				}
+				score := bucketScores[j]
+				scanRange(q, scoreBucketStart(c, score), scoreBucketEnd(c, score), &best, &labels, &ids)
 			}
 		}
 	}
 
-	for i := 0; i < K; i++ {
-		if labels[i] == 1 {
-			fraudCount++
-		}
-	}
-	return fraudCount
+	return best, labels, ids
+}
+
+func knnSearch(q *vec16) int {
+	_, labels, _ := knnTopKIVF(q)
+	return countFrauds(&labels)
 }
 
 var (
@@ -421,7 +524,7 @@ var (
 	responses = [...][]byte{
 		[]byte(`{"approved":true,"fraud_score":0}` + "\n"),
 		[]byte(`{"approved":true,"fraud_score":0.2}` + "\n"),
-		[]byte(`{"approved":true,"fraud_score":0.4}` + "\n"),
+		[]byte(`{"approved":false,"fraud_score":0.4}` + "\n"),
 		[]byte(`{"approved":false,"fraud_score":0.6}` + "\n"),
 		[]byte(`{"approved":false,"fraud_score":0.8}` + "\n"),
 		[]byte(`{"approved":false,"fraud_score":1}` + "\n"),
@@ -493,13 +596,14 @@ func loadIndex(path string) error {
 		return err
 	}
 
-	if len(mmapData) < 20 || string(mmapData[0:4]) != "RIV1" {
+	if len(mmapData) < 24 || string(mmapData[0:4]) != "RIV3" {
 		log.Fatal("index.bin: wrong magic")
 	}
 	indexN = int(binary.LittleEndian.Uint32(mmapData[4:8]))
 	indexK = int(binary.LittleEndian.Uint32(mmapData[8:12]))
 	dims := int(binary.LittleEndian.Uint32(mmapData[12:16]))
 	indexScale := int(binary.LittleEndian.Uint32(mmapData[16:20]))
+	indexScoreBuckets := int(binary.LittleEndian.Uint32(mmapData[20:24]))
 	if dims != vecD {
 		log.Fatalf("index.bin: wrong dimension %d (want %d)", dims, vecD)
 	}
@@ -509,27 +613,35 @@ func loadIndex(path string) error {
 	if indexK < 1 || indexK > ivfClusters {
 		log.Fatalf("index.bin: wrong cluster count %d", indexK)
 	}
+	if indexScoreBuckets != scoreBuckets {
+		log.Fatalf("index.bin: wrong score buckets %d (want %d)", indexScoreBuckets, scoreBuckets)
+	}
 
 	centroidBytes := indexK * vecD * 2
 	bboxBytes := indexK * vecD
-	offsetBytes := (indexK + 1) * 4
+	bucketBBoxBytes := indexK * scoreBuckets * vecD
+	offsetBytes := indexK * (scoreBuckets + 1) * 4
 	vecBytes := indexN * vecD
 	labelBytes := indexN
 	idPad := (4 - (labelBytes & 3)) & 3
 	idBytes := indexN * 4
-	expected := 20 + centroidBytes + bboxBytes*2 + offsetBytes + vecBytes + labelBytes + idPad + idBytes
+	expected := 24 + centroidBytes + bboxBytes*2 + bucketBBoxBytes*2 + offsetBytes + vecBytes + labelBytes + idPad + idBytes
 	if len(mmapData) < expected {
 		log.Fatalf("index.bin: truncated: got %d bytes, want at least %d", len(mmapData), expected)
 	}
 
-	offset := 20
+	offset := 24
 	idxCentroids = unsafe.Slice((*int16)(unsafe.Pointer(&mmapData[offset])), indexK*vecD)
 	offset += centroidBytes
 	idxBBoxMin = unsafe.Slice((*int8)(unsafe.Pointer(&mmapData[offset])), indexK*vecD)
 	offset += bboxBytes
 	idxBBoxMax = unsafe.Slice((*int8)(unsafe.Pointer(&mmapData[offset])), indexK*vecD)
 	offset += bboxBytes
-	idxOffsets = unsafe.Slice((*uint32)(unsafe.Pointer(&mmapData[offset])), indexK+1)
+	idxBucketMin = unsafe.Slice((*int8)(unsafe.Pointer(&mmapData[offset])), indexK*scoreBuckets*vecD)
+	offset += bucketBBoxBytes
+	idxBucketMax = unsafe.Slice((*int8)(unsafe.Pointer(&mmapData[offset])), indexK*scoreBuckets*vecD)
+	offset += bucketBBoxBytes
+	idxOffsets = unsafe.Slice((*uint32)(unsafe.Pointer(&mmapData[offset])), indexK*(scoreBuckets+1))
 	offset += offsetBytes
 	idxVecs = unsafe.Slice((*int8)(unsafe.Pointer(&mmapData[offset])), indexN*vecD)
 	offset += vecBytes

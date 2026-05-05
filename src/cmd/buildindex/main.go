@@ -13,15 +13,16 @@ import (
 )
 
 const (
-	D           = 14
-	vecD        = 16
-	scale       = 127
-	ambigMin    = 4
-	ambigMax    = 17
-	ivfClusters = 256
+	D            = 14
+	vecD         = 16
+	scale        = 127
+	ambigMin     = 3
+	ambigMax     = 19
+	ivfClusters  = 256
+	scoreBuckets = 23
 )
 
-var magic = [4]byte{'R', 'I', 'V', '1'}
+var magic = [4]byte{'R', 'I', 'V', '3'}
 
 type rawRef struct {
 	Vector [D]float32 `json:"vector"`
@@ -257,10 +258,28 @@ func assignClusters(vecs []byte, n, k int, centroids []int16) ([]uint16, []uint3
 	return assign, counts
 }
 
-func reorderByCluster(vecs []byte, labs []uint8, assign []uint16, counts []uint32, n, k int) ([]uint32, []byte, []uint8, []uint32, []byte, []byte) {
-	offsets := make([]uint32, k+1)
+func reorderByCluster(vecs []byte, labs []uint8, scores []uint8, assign []uint16, counts []uint32, n, k int) ([]uint32, []byte, []uint8, []uint32, []byte, []byte, []byte, []byte) {
+	bucketCounts := make([]uint32, k*scoreBuckets)
+	for i := 0; i < n; i++ {
+		c := int(assign[i])
+		score := int(scores[i])
+		if score < 0 {
+			score = 0
+		} else if score >= scoreBuckets {
+			score = scoreBuckets - 1
+		}
+		bucketCounts[c*scoreBuckets+score]++
+	}
+
+	offsets := make([]uint32, k*(scoreBuckets+1))
+	var running uint32
 	for c := 0; c < k; c++ {
-		offsets[c+1] = offsets[c] + counts[c]
+		base := c * (scoreBuckets + 1)
+		for score := 0; score < scoreBuckets; score++ {
+			offsets[base+score] = running
+			running += bucketCounts[c*scoreBuckets+score]
+		}
+		offsets[base+scoreBuckets] = running
 	}
 
 	outVecs := make([]byte, len(vecs))
@@ -268,6 +287,8 @@ func reorderByCluster(vecs []byte, labs []uint8, assign []uint16, counts []uint3
 	outIDs := make([]uint32, n)
 	bboxMin := make([]byte, k*vecD)
 	bboxMax := make([]byte, k*vecD)
+	bucketBBoxMin := make([]byte, k*scoreBuckets*vecD)
+	bucketBBoxMax := make([]byte, k*scoreBuckets*vecD)
 	minInit := int8(scale)
 	maxInit := -minInit
 	for c := 0; c < k; c++ {
@@ -275,13 +296,33 @@ func reorderByCluster(vecs []byte, labs []uint8, assign []uint16, counts []uint3
 			bboxMin[c*vecD+j] = byte(minInit)
 			bboxMax[c*vecD+j] = byte(maxInit)
 		}
+		for score := 0; score < scoreBuckets; score++ {
+			boff := (c*scoreBuckets + score) * vecD
+			for j := 0; j < vecD; j++ {
+				bucketBBoxMin[boff+j] = byte(minInit)
+				bucketBBoxMax[boff+j] = byte(maxInit)
+			}
+		}
 	}
 
-	writePos := append([]uint32(nil), offsets[:k]...)
+	writePos := make([]uint32, len(bucketCounts))
+	for c := 0; c < k; c++ {
+		base := c * (scoreBuckets + 1)
+		for score := 0; score < scoreBuckets; score++ {
+			writePos[c*scoreBuckets+score] = offsets[base+score]
+		}
+	}
 	for i := 0; i < n; i++ {
 		c := int(assign[i])
-		pos := int(writePos[c])
-		writePos[c]++
+		score := int(scores[i])
+		if score < 0 {
+			score = 0
+		} else if score >= scoreBuckets {
+			score = scoreBuckets - 1
+		}
+		widx := c*scoreBuckets + score
+		pos := int(writePos[widx])
+		writePos[widx]++
 
 		src := i * vecD
 		dst := pos * vecD
@@ -290,6 +331,7 @@ func reorderByCluster(vecs []byte, labs []uint8, assign []uint16, counts []uint3
 		outIDs[pos] = uint32(i)
 
 		boff := c * vecD
+		bboff := (c*scoreBuckets + score) * vecD
 		for j := 0; j < vecD; j++ {
 			v := int8(vecs[src+j])
 			if v < int8(bboxMin[boff+j]) {
@@ -297,6 +339,12 @@ func reorderByCluster(vecs []byte, labs []uint8, assign []uint16, counts []uint3
 			}
 			if v > int8(bboxMax[boff+j]) {
 				bboxMax[boff+j] = byte(v)
+			}
+			if v < int8(bucketBBoxMin[bboff+j]) {
+				bucketBBoxMin[bboff+j] = byte(v)
+			}
+			if v > int8(bucketBBoxMax[bboff+j]) {
+				bucketBBoxMax[bboff+j] = byte(v)
 			}
 		}
 	}
@@ -309,9 +357,19 @@ func reorderByCluster(vecs []byte, labs []uint8, assign []uint16, counts []uint3
 				bboxMax[boff+j] = 0
 			}
 		}
+		for score := 0; score < scoreBuckets; score++ {
+			base := c * (scoreBuckets + 1)
+			if offsets[base+score] == offsets[base+score+1] {
+				boff := (c*scoreBuckets + score) * vecD
+				for j := 0; j < vecD; j++ {
+					bucketBBoxMin[boff+j] = 0
+					bucketBBoxMax[boff+j] = 0
+				}
+			}
+		}
 	}
 
-	return offsets, outVecs, outLabs, outIDs, bboxMin, bboxMax
+	return offsets, outVecs, outLabs, outIDs, bboxMin, bboxMax, bucketBBoxMin, bucketBBoxMax
 }
 
 func main() {
@@ -349,6 +407,7 @@ func main() {
 
 	vecs := make([]byte, 0, 3000000*vecD)
 	labs := make([]uint8, 0, 3000000)
+	scores := make([]uint8, 0, 3000000)
 	total := 0
 	scoreCounts := [23]int{}
 
@@ -374,6 +433,7 @@ func main() {
 		if score >= 0 && score < len(scoreCounts) {
 			scoreCounts[score]++
 		}
+		scores = append(scores, uint8(score))
 		total++
 	}
 	n := total
@@ -392,9 +452,10 @@ func main() {
 
 	centroids := trainKMeans(vecs, n, k, sampleN, iters)
 	assign, counts := assignClusters(vecs, n, k, centroids)
-	offsets, outVecs, outLabs, outIDs, bboxMin, bboxMax := reorderByCluster(vecs, labs, assign, counts, n, k)
+	offsets, outVecs, outLabs, outIDs, bboxMin, bboxMax, bucketBBoxMin, bucketBBoxMax := reorderByCluster(vecs, labs, scores, assign, counts, n, k)
 	vecs = nil
 	labs = nil
+	scores = nil
 	assign = nil
 
 	out, err := os.Create(outPath)
@@ -408,9 +469,12 @@ func main() {
 	binary.Write(out, binary.LittleEndian, uint32(k))
 	binary.Write(out, binary.LittleEndian, uint32(vecD))
 	binary.Write(out, binary.LittleEndian, uint32(scale))
+	binary.Write(out, binary.LittleEndian, uint32(scoreBuckets))
 	binary.Write(out, binary.LittleEndian, centroids)
 	out.Write(bboxMin)
 	out.Write(bboxMax)
+	out.Write(bucketBBoxMin)
+	out.Write(bucketBBoxMax)
 	binary.Write(out, binary.LittleEndian, offsets)
 	out.Write(outVecs)
 	out.Write(outLabs)
