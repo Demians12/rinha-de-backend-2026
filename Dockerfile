@@ -1,12 +1,12 @@
 # Stage 1: Compile Go binaries
 # $BUILDPLATFORM = native (ARM64 on M1) — Go cross-compila para amd64 sem QEMU
-FROM --platform=$BUILDPLATFORM golang:1.22-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
 
 WORKDIR /build
 COPY src/go.mod ./
 RUN go mod download
 COPY src/ ./
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v3 \
     go build -ldflags="-s -w" -o /bin/server      ./cmd/server
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -ldflags="-s -w" -o /bin/buildindex  ./cmd/buildindex
@@ -15,7 +15,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 
 # Stage 2: Build compact rule/KNN fallback index from 3M references
 # Runs at build time — zero startup overhead at runtime
-FROM golang:1.22-alpine AS indexer
+FROM golang:1.24-alpine AS indexer
 
 WORKDIR /app
 COPY --from=builder /bin/buildindex ./buildindex

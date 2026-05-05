@@ -3,25 +3,25 @@ package main
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"log"
 	"math"
 	"net"
-	"net/http"
 	"os"
+	"strconv"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
 
 	jsoniter "github.com/json-iterator/go"
+	"github.com/valyala/fasthttp"
 )
 
 const (
-	D         = 14
-	K         = 5
-	THRESHOLD = 0.6
-	scale     = 10000
-
+	D        = 14
+	vecD     = 16
+	K        = 5
+	scale    = 10000
 	ambigMin = 4
 	ambigMax = 17
 )
@@ -33,7 +33,7 @@ var (
 	idxLabs  []uint8
 )
 
-type vec14 [D]int16
+type vec16 [vecD]int16
 
 func q01(x float64) int16 {
 	if x <= 0 {
@@ -81,47 +81,75 @@ func parseRFC3339Parts(s string) (hour, dow, epochMinute int, ok bool) {
 	return h, (days + 3) % 7, days*1440 + h*60 + mi, true
 }
 
-func ruleScore(v *vec14) int {
+func ruleScore(v *vec16) int {
 	score := 0
-	add := func(ok bool) {
-		if ok {
-			score++
-		}
+	if v[0] >= 2000 {
+		score++
 	}
-
-	add(v[0] >= 2000)
-	add(v[0] >= 500)
-	add(v[1] >= 5000)
-	add(v[1] >= 3333)
-	add(v[3] < 3043)
-	add(v[3] < 3478 || v[3] >= 9130)
-	add(v[2] >= 8000)
-	add(v[2] >= 1000)
-	add(v[8] >= 4000)
-	add(v[8] >= 3000)
-	add(v[11] >= 5000)
-	add(v[12] >= 7500)
-	add(v[12] >= 4500)
-	add(v[9] >= 5000)
-	add(v[10] < 5000)
-	add(v[7] >= 2000)
-	add(v[7] >= 500)
-	add(v[5] >= 0 && v[5] <= 69)
-	add(v[5] >= 0 && v[5] <= 208)
-	add(v[6] >= 2000)
-	add(v[6] >= 200)
-	add(v[13] <= 100)
-
+	if v[0] >= 500 {
+		score++
+	}
+	if v[1] >= 5000 {
+		score++
+	}
+	if v[1] >= 3333 {
+		score++
+	}
+	if v[3] < 3043 {
+		score++
+	}
+	if v[3] < 3478 || v[3] >= 9130 {
+		score++
+	}
+	if v[2] >= 8000 {
+		score++
+	}
+	if v[2] >= 1000 {
+		score++
+	}
+	if v[8] >= 4000 {
+		score++
+	}
+	if v[8] >= 3000 {
+		score++
+	}
+	if v[11] >= 5000 {
+		score++
+	}
+	if v[12] >= 7500 {
+		score++
+	}
+	if v[12] >= 4500 {
+		score++
+	}
+	if v[9] >= 5000 {
+		score++
+	}
+	if v[10] < 5000 {
+		score++
+	}
+	if v[7] >= 2000 {
+		score++
+	}
+	if v[7] >= 500 {
+		score++
+	}
+	if v[5] >= 0 && v[5] <= 69 {
+		score++
+	}
+	if v[5] >= 0 && v[5] <= 208 {
+		score++
+	}
+	if v[6] >= 2000 {
+		score++
+	}
+	if v[6] >= 200 {
+		score++
+	}
+	if v[13] <= 100 {
+		score++
+	}
 	return score
-}
-
-func dist2(q *vec14, ref []int16) int64 {
-	var sum int64
-	for i := 0; i < D; i++ {
-		d := int64(q[i]) - int64(ref[i])
-		sum += d * d
-	}
-	return sum
 }
 
 func insertTopK(best *[K]int64, labels *[K]uint8, d int64, label uint8) {
@@ -138,11 +166,11 @@ func insertTopK(best *[K]int64, labels *[K]uint8, d int64, label uint8) {
 	labels[pos] = label
 }
 
-func knnSearch(q *vec14) (fraudCount int) {
+func knnSearch(q *vec16) (fraudCount int) {
 	best := [K]int64{math.MaxInt64, math.MaxInt64, math.MaxInt64, math.MaxInt64, math.MaxInt64}
 	var labels [K]uint8
 	for i := 0; i < indexN; i++ {
-		ref := idxVecs[i*D : i*D+D]
+		ref := (*vec16)(unsafe.Pointer(&idxVecs[i*vecD]))
 		insertTopK(&best, &labels, dist2(q, ref), idxLabs[i])
 	}
 	for i := 0; i < K; i++ {
@@ -161,8 +189,23 @@ var (
 	maxKm           = 1000.0
 	maxTx24h        = 20.0
 	maxMerchantAmt  = 10000.0
-	mccRisk         map[string]float64
+	mccRisk         [10000]int16
 )
+
+func mccIdx(s string) int {
+	if len(s) != 4 {
+		return -1
+	}
+	n := 0
+	for i := 0; i < 4; i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			return -1
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
+}
 
 type Payload struct {
 	ID          string `json:"id"`
@@ -192,7 +235,11 @@ type Payload struct {
 	} `json:"last_transaction"`
 }
 
-func vectorize(p *Payload, v *vec14) {
+var payloadPool = sync.Pool{
+	New: func() any { return &Payload{} },
+}
+
+func vectorize(p *Payload, v *vec16) {
 	v[0] = q01(p.Transaction.Amount / maxAmount)
 	v[1] = q01(float64(p.Transaction.Installments) / maxInstallments)
 
@@ -254,50 +301,60 @@ func vectorize(p *Payload, v *vec14) {
 		v[11] = scale
 	}
 
-	if risk, ok := mccRisk[p.Merchant.MCC]; ok {
-		v[12] = q01(risk)
+	if idx := mccIdx(p.Merchant.MCC); idx >= 0 {
+		v[12] = mccRisk[idx]
 	} else {
 		v[12] = 5000
 	}
 
 	v[13] = q01(p.Merchant.AvgAmount / maxMerchantAmt)
+
+	v[14] = 0
+	v[15] = 0
 }
 
 var json2 = jsoniter.ConfigCompatibleWithStandardLibrary
 
-var responses = [...][]byte{
-	[]byte(`{"approved":true,"fraud_score":0}` + "\n"),
-	[]byte(`{"approved":true,"fraud_score":0.2}` + "\n"),
-	[]byte(`{"approved":true,"fraud_score":0.4}` + "\n"),
-	[]byte(`{"approved":false,"fraud_score":0.6}` + "\n"),
-	[]byte(`{"approved":false,"fraud_score":0.8}` + "\n"),
-	[]byte(`{"approved":false,"fraud_score":1}` + "\n"),
-}
+var (
+	ctJSON    = []byte("application/json")
+	responses = [...][]byte{
+		[]byte(`{"approved":true,"fraud_score":0}` + "\n"),
+		[]byte(`{"approved":true,"fraud_score":0.2}` + "\n"),
+		[]byte(`{"approved":true,"fraud_score":0.4}` + "\n"),
+		[]byte(`{"approved":false,"fraud_score":0.6}` + "\n"),
+		[]byte(`{"approved":false,"fraud_score":0.8}` + "\n"),
+		[]byte(`{"approved":false,"fraud_score":1}` + "\n"),
+	}
+)
 
-func writeScore(w http.ResponseWriter, fraudCount int) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(responses[fraudCount])
-}
+func fraudHandler(ctx *fasthttp.RequestCtx) {
+	p := payloadPool.Get().(*Payload)
+	defer func() {
+		p.Customer.KnownMerchants = p.Customer.KnownMerchants[:0]
+		p.LastTx = nil
+		payloadPool.Put(p)
+	}()
 
-func fraudHandler(w http.ResponseWriter, r *http.Request) {
-	var p Payload
-	if err := json2.NewDecoder(r.Body).Decode(&p); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
+	if err := json2.Unmarshal(ctx.PostBody(), p); err != nil {
+		ctx.SetStatusCode(fasthttp.StatusBadRequest)
 		return
 	}
 
-	var v vec14
-	vectorize(&p, &v)
+	var v vec16
+	vectorize(p, &v)
 	score := ruleScore(&v)
+
+	var fraudCount int
 	if score < ambigMin {
-		writeScore(w, 0)
-		return
+		fraudCount = 0
+	} else if score > ambigMax {
+		fraudCount = 5
+	} else {
+		fraudCount = knnSearch(&v)
 	}
-	if score > ambigMax {
-		writeScore(w, 5)
-		return
-	}
-	writeScore(w, knnSearch(&v))
+
+	ctx.SetContentTypeBytes(ctJSON)
+	ctx.SetBody(responses[fraudCount])
 }
 
 func loadIndex(path string) error {
@@ -323,13 +380,13 @@ func loadIndex(path string) error {
 	}
 	indexN = int(binary.LittleEndian.Uint32(mmapData[4:8]))
 	dims := int(binary.LittleEndian.Uint32(mmapData[8:12]))
-	if dims != D {
-		log.Fatalf("index.bin: wrong dimension %d", dims)
+	if dims != vecD {
+		log.Fatalf("index.bin: wrong dimension %d (want %d)", dims, vecD)
 	}
 
 	offset := 12
-	vecBytes := indexN * D * 2
-	idxVecs = unsafe.Slice((*int16)(unsafe.Pointer(&mmapData[offset])), indexN*D)
+	vecBytes := indexN * vecD * 2
+	idxVecs = unsafe.Slice((*int16)(unsafe.Pointer(&mmapData[offset])), indexN*vecD)
 	offset += vecBytes
 	idxLabs = mmapData[offset : offset+indexN]
 
@@ -342,11 +399,26 @@ func loadMCCRisk(path string) error {
 		return err
 	}
 	defer f.Close()
+
 	var m map[string]float64
-	if err := json.NewDecoder(f).Decode(&m); err != nil {
+	if err := jsoniter.NewDecoder(f).Decode(&m); err != nil {
 		return err
 	}
-	mccRisk = m
+
+	for k, v := range m {
+		n, err := strconv.Atoi(k)
+		if err != nil || n < 0 || n >= 10000 {
+			continue
+		}
+		val := int16(math.Round(v * scale))
+		if val < 0 {
+			val = 0
+		}
+		if val > scale {
+			val = scale
+		}
+		mccRisk[n] = val
+	}
 	return nil
 }
 
@@ -373,23 +445,30 @@ func main() {
 	log.Printf("Index loaded: ambiguous refs=%d", indexN)
 
 	os.Remove(udsPath)
+
+	mux := func(ctx *fasthttp.RequestCtx) {
+		switch string(ctx.Path()) {
+		case "/fraud-score":
+			fraudHandler(ctx)
+		case "/ready":
+			ctx.SetStatusCode(fasthttp.StatusOK)
+		default:
+			ctx.SetStatusCode(fasthttp.StatusNotFound)
+		}
+	}
+
+	srv := &fasthttp.Server{
+		Handler:            mux,
+		ReadTimeout:        2 * time.Second,
+		WriteTimeout:       2 * time.Second,
+		MaxRequestBodySize: 64 * 1024,
+	}
+
 	ln, err := net.Listen("unix", udsPath)
 	if err != nil {
 		log.Fatalf("listen unix: %v", err)
 	}
 	os.Chmod(udsPath, 0666)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/fraud-score", fraudHandler)
-	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-
-	srv := &http.Server{
-		Handler:      mux,
-		ReadTimeout:  2 * time.Second,
-		WriteTimeout: 2 * time.Second,
-	}
 
 	log.Printf("Listening on %s", udsPath)
 	if err := srv.Serve(ln); err != nil {

@@ -12,6 +12,7 @@ import (
 
 const (
 	D        = 14
+	vecD     = 16
 	scale    = 10000
 	ambigMin = 4
 	ambigMax = 17
@@ -127,6 +128,9 @@ func main() {
 		}
 		if score >= ambigMin && score <= ambigMax {
 			vecs = append(vecs, q[:]...)
+			for i := D; i < vecD; i++ {
+				vecs = append(vecs, 0)
+			}
 			if r.Label == "fraud" {
 				labs = append(labs, 1)
 			} else {
@@ -145,7 +149,7 @@ func main() {
 
 	out.Write(magic[:])
 	binary.Write(out, binary.LittleEndian, uint32(kept))
-	binary.Write(out, binary.LittleEndian, uint32(D))
+	binary.Write(out, binary.LittleEndian, uint32(vecD))
 
 	for _, v := range vecs {
 		binary.Write(out, binary.LittleEndian, v)

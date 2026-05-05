@@ -44,6 +44,9 @@ services:
       UDS_PATH: "/sockets/api1.sock"
       INDEX_PATH: "/app/resources/index.bin"
       MCC_RISK_PATH: "/app/resources/mcc_risk.json"
+      GOGC: "off"
+      GOMEMLIMIT: "140MiB"
+      GOMAXPROCS: "1"
     healthcheck:
       test: ["CMD", "/app/healthcheck", "/sockets/api1.sock"]
       interval: 1s
@@ -58,6 +61,9 @@ services:
       UDS_PATH: "/sockets/api2.sock"
       INDEX_PATH: "/app/resources/index.bin"
       MCC_RISK_PATH: "/app/resources/mcc_risk.json"
+      GOGC: "off"
+      GOMEMLIMIT: "140MiB"
+      GOMAXPROCS: "1"
     healthcheck:
       test: ["CMD", "/app/healthcheck", "/sockets/api2.sock"]
       interval: 1s
