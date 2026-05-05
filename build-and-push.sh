@@ -79,7 +79,7 @@ CURRENT_BRANCH=$(git branch --show-current)
 git checkout -B submission
 
 # Remove tudo que não é necessário para rodar o teste
-git rm -rf src/ --cached 2>/dev/null || true
+git rm -rf src/ 2>/dev/null || true
 git rm -f test-local.sh build-and-push.sh SETUP.md 2>/dev/null || true
 
 # Adiciona só o necessário
