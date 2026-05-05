@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"runtime"
 	"syscall"
 	"time"
 	"unsafe"
@@ -337,9 +336,6 @@ func loadMCCRisk(path string) error {
 }
 
 func main() {
-	// Single OS thread: avoids scheduler overhead; VP-tree is CPU-bound with warm cache
-	runtime.GOMAXPROCS(1)
-
 	indexPath := os.Getenv("INDEX_PATH")
 	if indexPath == "" {
 		indexPath = "/app/resources/index.bin"
