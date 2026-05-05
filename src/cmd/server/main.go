@@ -259,7 +259,24 @@ func knnTopKIVF(q *vec16) ([K]int64, [K]uint8, [K]uint32) {
 			continue
 		}
 		scanned[c] = true
-		scanRange(q, clusterStart(c), clusterEnd(c), &best, &labels, &ids)
+		var bScores [scoreBuckets]int
+		var bBounds [scoreBuckets]int64
+		bN := 0
+		for score := 0; score < scoreBuckets; score++ {
+			if scoreBucketStart(c, score) == scoreBucketEnd(c, score) {
+				continue
+			}
+			bound := bucketLowerBound(q, c, score)
+			if bound <= best[K-1] {
+				bN = insertScoreBucket(&bScores, &bBounds, bN, score, bound)
+			}
+		}
+		for j := 0; j < bN; j++ {
+			if bBounds[j] > best[K-1] {
+				break
+			}
+			scanRange(q, scoreBucketStart(c, bScores[j]), scoreBucketEnd(c, bScores[j]), &best, &labels, &ids)
+		}
 	}
 	if ivfRepair {
 		var repairC [ivfClusters]int
