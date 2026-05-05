@@ -24,6 +24,8 @@ COPY resources/references.json.gz   ./resources/references.json.gz
 
 RUN REFS_PATH=./resources/references.json.gz \
     INDEX_PATH=./resources/index.bin \
+    IVF_TRAIN_SAMPLE=131072 \
+    IVF_TRAIN_ITERS=20 \
     ./buildindex
 
 # Stage 3: Minimal runtime image
