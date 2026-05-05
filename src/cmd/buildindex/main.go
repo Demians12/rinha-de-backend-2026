@@ -6,138 +6,69 @@ import (
 	"encoding/json"
 	"log"
 	"math"
-	"math/rand"
 	"os"
 	"time"
 )
 
-const D = 14
-
-var magic = [4]byte{'V', 'P', 'Q', 'U'}
-
-var (
-	vecs   []uint8
-	labs   []uint8
-	nodeL  []int32
-	nodeR  []int32
-	nodeT  []float32
-	vpArr  []int32
-	nNodes int32
+const (
+	D        = 14
+	scale    = 10000
+	ambigMin = 4
+	ambigMax = 17
 )
 
-func quantize(f float32) uint8 {
-	if f < -0.5 {
-		return 255
-	}
-	v := f * 254.0
-	if v < 0 {
-		return 0
-	}
-	if v > 254 {
-		return 254
-	}
-	return uint8(v + 0.5)
-}
-
-func dequantize(u uint8) float32 {
-	if u == 255 {
-		return -1.0
-	}
-	return float32(u) / 254.0
-}
-
-func distQQ(a, b []uint8) float32 {
-	var sum float32
-	for i := 0; i < D; i++ {
-		d := dequantize(a[i]) - dequantize(b[i])
-		sum += d * d
-	}
-	return float32(math.Sqrt(float64(sum)))
-}
-
-func buildVP(indices []int32) int32 {
-	if len(indices) == 0 {
-		return -1
-	}
-
-	myIdx := nNodes
-	nNodes++
-
-	vpPos := rand.Intn(len(indices))
-	vp := indices[vpPos]
-	vpArr[myIdx] = vp
-
-	indices[vpPos], indices[len(indices)-1] = indices[len(indices)-1], indices[vpPos]
-	rest := indices[:len(indices)-1]
-
-	if len(rest) == 0 {
-		nodeL[myIdx] = -1
-		nodeR[myIdx] = -1
-		nodeT[myIdx] = 0
-		return myIdx
-	}
-
-	dists := make([]float32, len(rest))
-	vpVec := vecs[vp*D : vp*D+D]
-	for i, idx := range rest {
-		dists[i] = distQQ(vpVec, vecs[idx*D:idx*D+D])
-	}
-
-	mu := medianFloat32(dists)
-	nodeT[myIdx] = mu
-
-	inside := rest[:0]
-	outside := make([]int32, 0, len(rest)/2)
-	for i, idx := range rest {
-		if dists[i] < mu {
-			inside = append(inside, idx)
-		} else {
-			outside = append(outside, idx)
-		}
-	}
-
-	nodeL[myIdx] = buildVP(inside)
-	nodeR[myIdx] = buildVP(outside)
-
-	return myIdx
-}
-
-func medianFloat32(a []float32) float32 {
-	if len(a) == 0 {
-		return 0
-	}
-	b := make([]float32, len(a))
-	copy(b, a)
-	return quickselect(b, len(b)/2)
-}
-
-func quickselect(a []float32, k int) float32 {
-	if len(a) == 1 {
-		return a[0]
-	}
-	pivot := a[len(a)/2]
-	var lo, mid, hi []float32
-	for _, v := range a {
-		if v < pivot {
-			lo = append(lo, v)
-		} else if v == pivot {
-			mid = append(mid, v)
-		} else {
-			hi = append(hi, v)
-		}
-	}
-	if k < len(lo) {
-		return quickselect(lo, k)
-	}
-	if k < len(lo)+len(mid) {
-		return pivot
-	}
-	return quickselect(hi, k-len(lo)-len(mid))
-}
+var magic = [4]byte{'R', 'K', 'N', '4'}
 
 type rawRef struct {
 	Vector [D]float32 `json:"vector"`
 	Label  string     `json:"label"`
+}
+
+func q4(f float32) int16 {
+	if f < -0.5 {
+		return -scale
+	}
+	if f < 0 {
+		return 0
+	}
+	if f > 1 {
+		return scale
+	}
+	return int16(math.Round(float64(f * scale)))
+}
+
+func ruleScore(v *[D]int16) int {
+	score := 0
+	add := func(ok bool) {
+		if ok {
+			score++
+		}
+	}
+
+	add(v[0] >= 2000) // amount >= 2000
+	add(v[0] >= 500)  // amount >= 500
+	add(v[1] >= 5000) // installments >= 6
+	add(v[1] >= 3333) // installments >= 4
+	add(v[3] < 3043)  // hour < 7
+	add(v[3] < 3478 || v[3] >= 9130)
+	add(v[2] >= 8000) // amount/customer_avg >= 8x
+	add(v[2] >= 1000) // amount/customer_avg >= 1x
+	add(v[8] >= 4000) // tx_count_24h >= 8
+	add(v[8] >= 3000) // tx_count_24h >= 6
+	add(v[11] >= 5000)
+	add(v[12] >= 7500)
+	add(v[12] >= 4500)
+	add(v[9] >= 5000)
+	add(v[10] < 5000)
+	add(v[7] >= 2000) // km_from_home >= 200
+	add(v[7] >= 500)  // km_from_home >= 50
+	add(v[5] >= 0 && v[5] <= 69)
+	add(v[5] >= 0 && v[5] <= 208)
+	add(v[6] >= 2000)
+	add(v[6] >= 200)
+	add(v[13] <= 100) // merchant_avg_amount <= 100
+
+	return score
 }
 
 func main() {
@@ -156,92 +87,74 @@ func main() {
 	if err != nil {
 		log.Fatalf("open refs: %v", err)
 	}
+	defer f.Close()
+
 	gz, err := gzip.NewReader(f)
 	if err != nil {
 		log.Fatalf("gzip: %v", err)
 	}
-	var refs []rawRef
-	if err := json.NewDecoder(gz).Decode(&refs); err != nil {
-		log.Fatalf("decode: %v", err)
+	defer gz.Close()
+
+	dec := json.NewDecoder(gz)
+	tok, err := dec.Token()
+	if err != nil {
+		log.Fatalf("decode opening token: %v", err)
 	}
-	gz.Close()
-	f.Close()
+	if d, ok := tok.(json.Delim); !ok || d != '[' {
+		log.Fatalf("references must be a JSON array")
+	}
 
-	N := len(refs)
-	log.Printf("Loaded %d references (%.1fs)", N, time.Since(t0).Seconds())
+	vecs := make([]int16, 0, 128000*D)
+	labs := make([]uint8, 0, 128000)
+	total := 0
+	kept := 0
+	scoreCounts := [23]int{}
 
-	vecs = make([]uint8, N*D)
-	labs = make([]uint8, N)
-	for i, r := range refs {
-		for d := 0; d < D; d++ {
-			vecs[i*D+d] = quantize(r.Vector[d])
+	for dec.More() {
+		var r rawRef
+		if err := dec.Decode(&r); err != nil {
+			log.Fatalf("decode ref %d: %v", total, err)
 		}
-		if r.Label == "fraud" {
-			labs[i] = 1
+
+		var q [D]int16
+		for i := 0; i < D; i++ {
+			q[i] = q4(r.Vector[i])
 		}
+
+		score := ruleScore(&q)
+		if score >= 0 && score < len(scoreCounts) {
+			scoreCounts[score]++
+		}
+		if score >= ambigMin && score <= ambigMax {
+			vecs = append(vecs, q[:]...)
+			if r.Label == "fraud" {
+				labs = append(labs, 1)
+			} else {
+				labs = append(labs, 0)
+			}
+			kept++
+		}
+		total++
 	}
-	refs = nil
-
-	log.Printf("Quantized vectors (%.1fs)", time.Since(t0).Seconds())
-
-	nodeL = make([]int32, N)
-	nodeR = make([]int32, N)
-	nodeT = make([]float32, N)
-	vpArr = make([]int32, N)
-
-	indices := make([]int32, N)
-	for i := range indices {
-		indices[i] = int32(i)
-	}
-
-	log.Printf("Building VP-Tree over %d vectors...", N)
-	root := buildVP(indices)
-	log.Printf("VP-Tree built: %d nodes, root=%d (%.1fs)", nNodes, root, time.Since(t0).Seconds())
 
 	out, err := os.Create(outPath)
 	if err != nil {
 		log.Fatalf("create index: %v", err)
 	}
+	defer out.Close()
 
-	// Header: magic(4) + N(4) + D(4) + root(4) + nNodes(4)
 	out.Write(magic[:])
-	binary.Write(out, binary.LittleEndian, uint32(N))
+	binary.Write(out, binary.LittleEndian, uint32(kept))
 	binary.Write(out, binary.LittleEndian, uint32(D))
-	binary.Write(out, binary.LittleEndian, root)
-	binary.Write(out, binary.LittleEndian, uint32(nNodes))
 
-	// Vectors: N*D uint8
-	out.Write(vecs)
-
-	// Labels: N uint8
+	for _, v := range vecs {
+		binary.Write(out, binary.LittleEndian, v)
+	}
 	out.Write(labs)
 
-	// Align to 4 bytes
-	total := N*D + N
-	if total%4 != 0 {
-		pad := make([]byte, 4-total%4)
-		out.Write(pad)
-	}
-
-	// Nodes: non-interleaved arrays — vp[nNodes] left[nNodes] right[nNodes] thresh[nNodes]
-	// Server reads them as four separate unsafe.Slice arrays at fixed offsets.
-	nn := int(nNodes)
-	for i := 0; i < nn; i++ {
-		binary.Write(out, binary.LittleEndian, vpArr[i])
-	}
-	for i := 0; i < nn; i++ {
-		binary.Write(out, binary.LittleEndian, nodeL[i])
-	}
-	for i := 0; i < nn; i++ {
-		binary.Write(out, binary.LittleEndian, nodeR[i])
-	}
-	for i := 0; i < nn; i++ {
-		binary.Write(out, binary.LittleEndian, nodeT[i])
-	}
-
-	out.Close()
-
-	fi, _ := os.Stat(outPath)
+	fi, _ := out.Stat()
+	log.Printf("Read %d references, kept %d ambiguous refs (scores %d..%d)", total, kept, ambigMin, ambigMax)
+	log.Printf("Rule score counts: %v", scoreCounts)
 	log.Printf("Index written: %s (%.1f MB, %.1fs)",
 		outPath, float64(fi.Size())/1e6, time.Since(t0).Seconds())
 }

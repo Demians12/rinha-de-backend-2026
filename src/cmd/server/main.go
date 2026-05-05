@@ -1,9 +1,7 @@
-// server: HTTP API for fraud detection via VP-Tree KNN search
-// Listens on Unix Domain Socket to eliminate TCP overhead between HAProxy and API
+// server: HTTP API for fraud detection via cheap rules + exact KNN fallback.
 package main
 
 import (
-	"container/heap"
 	"encoding/binary"
 	"encoding/json"
 	"log"
@@ -11,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -23,117 +20,137 @@ const (
 	D         = 14
 	K         = 5
 	THRESHOLD = 0.6
+	scale     = 10000
+
+	ambigMin = 4
+	ambigMax = 17
 )
 
 var (
-	mmapData    []byte
-	indexN      int
-	indexRoot   int32
-	indexNNodes int32
-
-	idxVecs   []uint8
-	idxLabs   []uint8
-	idxVP     []int32
-	idxLeft   []int32
-	idxRight  []int32
-	idxThresh []float32
+	mmapData []byte
+	indexN   int
+	idxVecs  []int16
+	idxLabs  []uint8
 )
 
-// dqTable replaces the dequantize branch with a 1KB L1-resident lookup.
-var dqTable [256]float32
+type vec14 [D]int16
 
-func init() {
-	for i := 0; i < 255; i++ {
-		dqTable[i] = float32(i) / 254.0
+func q01(x float64) int16 {
+	if x <= 0 {
+		return 0
 	}
-	dqTable[255] = -1.0
+	if x >= 1 {
+		return scale
+	}
+	return int16(math.Round(x * scale))
 }
 
-func euclidean(q []float32, refIdx int32) float32 {
-	ref := idxVecs[refIdx*D : refIdx*D+D]
-	var sum float32
+func daysFromCivil(y, m, d int) int {
+	if m <= 2 {
+		y--
+	}
+	era := y / 400
+	if y < 0 && y%400 != 0 {
+		era--
+	}
+	yoe := y - era*400
+	mp := m
+	if mp > 2 {
+		mp -= 3
+	} else {
+		mp += 9
+	}
+	doy := (153*mp+2)/5 + d - 1
+	doe := yoe*365 + yoe/4 - yoe/100 + doy
+	return era*146097 + doe - 719468
+}
+
+func parseRFC3339Parts(s string) (hour, dow, epochMinute int, ok bool) {
+	if len(s) < 20 {
+		return
+	}
+	y := int(s[0]-'0')*1000 + int(s[1]-'0')*100 + int(s[2]-'0')*10 + int(s[3]-'0')
+	mo := int(s[5]-'0')*10 + int(s[6]-'0')
+	d := int(s[8]-'0')*10 + int(s[9]-'0')
+	h := int(s[11]-'0')*10 + int(s[12]-'0')
+	mi := int(s[14]-'0')*10 + int(s[15]-'0')
+	if mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 {
+		return
+	}
+	days := daysFromCivil(y, mo, d)
+	return h, (days + 3) % 7, days*1440 + h*60 + mi, true
+}
+
+func ruleScore(v *vec14) int {
+	score := 0
+	add := func(ok bool) {
+		if ok {
+			score++
+		}
+	}
+
+	add(v[0] >= 2000)
+	add(v[0] >= 500)
+	add(v[1] >= 5000)
+	add(v[1] >= 3333)
+	add(v[3] < 3043)
+	add(v[3] < 3478 || v[3] >= 9130)
+	add(v[2] >= 8000)
+	add(v[2] >= 1000)
+	add(v[8] >= 4000)
+	add(v[8] >= 3000)
+	add(v[11] >= 5000)
+	add(v[12] >= 7500)
+	add(v[12] >= 4500)
+	add(v[9] >= 5000)
+	add(v[10] < 5000)
+	add(v[7] >= 2000)
+	add(v[7] >= 500)
+	add(v[5] >= 0 && v[5] <= 69)
+	add(v[5] >= 0 && v[5] <= 208)
+	add(v[6] >= 2000)
+	add(v[6] >= 200)
+	add(v[13] <= 100)
+
+	return score
+}
+
+func dist2(q *vec14, ref []int16) int64 {
+	var sum int64
 	for i := 0; i < D; i++ {
-		d := q[i] - dqTable[ref[i]]
+		d := int64(q[i]) - int64(ref[i])
 		sum += d * d
 	}
-	return float32(math.Sqrt(float64(sum)))
+	return sum
 }
 
-type knnItem struct {
-	dist  float32
-	label uint8
-}
-
-type knnHeap []knnItem
-
-func (h knnHeap) Len() int            { return len(h) }
-func (h knnHeap) Less(i, j int) bool  { return h[i].dist > h[j].dist }
-func (h knnHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
-func (h *knnHeap) Push(x interface{}) { *h = append(*h, x.(knnItem)) }
-func (h *knnHeap) Pop() interface{} {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[:n-1]
-	return x
-}
-
-// heapPool eliminates per-request knnHeap allocation.
-var heapPool = sync.Pool{
-	New: func() interface{} {
-		h := make(knnHeap, 0, K+1)
-		return &h
-	},
-}
-
-func vpSearch(nodeIdx int32, q []float32, h *knnHeap, tau float32) float32 {
-	if nodeIdx < 0 {
-		return tau
+func insertTopK(best *[K]int64, labels *[K]uint8, d int64, label uint8) {
+	if d >= best[K-1] {
+		return
 	}
-
-	vp := idxVP[nodeIdx]
-	d := euclidean(q, vp)
-
-	if h.Len() < K || d < (*h)[0].dist {
-		if h.Len() == K {
-			heap.Pop(h)
-		}
-		heap.Push(h, knnItem{d, idxLabs[vp]})
-		if h.Len() == K {
-			tau = (*h)[0].dist
-		}
+	pos := K - 1
+	for pos > 0 && d < best[pos-1] {
+		best[pos] = best[pos-1]
+		labels[pos] = labels[pos-1]
+		pos--
 	}
-
-	mu := idxThresh[nodeIdx]
-	left := idxLeft[nodeIdx]
-	right := idxRight[nodeIdx]
-
-	if d < mu {
-		tau = vpSearch(left, q, h, tau)
-		if d+tau >= mu {
-			tau = vpSearch(right, q, h, tau)
-		}
-	} else {
-		tau = vpSearch(right, q, h, tau)
-		if d-tau <= mu {
-			tau = vpSearch(left, q, h, tau)
-		}
-	}
-	return tau
+	best[pos] = d
+	labels[pos] = label
 }
 
-func knnSearch(q []float32) (fraudCount, total int) {
-	hp := heapPool.Get().(*knnHeap)
-	*hp = (*hp)[:0]
-	vpSearch(indexRoot, q, hp, math.MaxFloat32)
-	total = hp.Len()
-	for _, item := range *hp {
-		if item.label == 1 {
+func knnSearch(q *vec14) (fraudCount int) {
+	best := [K]int64{math.MaxInt64, math.MaxInt64, math.MaxInt64, math.MaxInt64, math.MaxInt64}
+	var labels [K]uint8
+	for i := 0; i < indexN; i++ {
+		ref := idxVecs[i*D : i*D+D]
+		insertTopK(&best, &labels, dist2(q, ref), idxLabs[i])
+	}
+	for i := 0; i < K; i++ {
+		if labels[i] == 1 {
 			fraudCount++
 		}
 	}
-	heapPool.Put(hp)
-	return
+	return fraudCount
 }
 
 var (
@@ -144,18 +161,8 @@ var (
 	maxKm           = 1000.0
 	maxTx24h        = 20.0
 	maxMerchantAmt  = 10000.0
-	mccRisk         map[string]float32
+	mccRisk         map[string]float64
 )
-
-func clamp(x, lo, hi float64) float32 {
-	if x < lo {
-		return float32(lo)
-	}
-	if x > hi {
-		return float32(hi)
-	}
-	return float32(x)
-}
 
 type Payload struct {
 	ID          string `json:"id"`
@@ -185,93 +192,54 @@ type Payload struct {
 	} `json:"last_transaction"`
 }
 
-// parseRFC3339HourDOW extracts hour (0-23) and weekday (0=Mon..6=Sun) from a
-// UTC RFC3339 string without calling time.Parse, saving ~500ns on the hot path.
-func parseRFC3339HourDOW(s string) (hour, dow int, ok bool) {
-	if len(s) < 20 {
-		return
-	}
-	y := int(s[0]-'0')*1000 + int(s[1]-'0')*100 + int(s[2]-'0')*10 + int(s[3]-'0')
-	mo := int(s[5]-'0')*10 + int(s[6]-'0')
-	d := int(s[8]-'0')*10 + int(s[9]-'0')
-	h := int(s[11]-'0')*10 + int(s[12]-'0')
-	if mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 {
-		return
-	}
-	// Tomohiko Sakamoto's algorithm — 0=Sunday
-	tab := [12]int{0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4}
-	yy := y
-	if mo < 3 {
-		yy--
-	}
-	w := (yy + yy/4 - yy/100 + yy/400 + tab[mo-1] + d) % 7
-	return h, (w + 6) % 7, true // convert to 0=Monday
-}
-
-// vec14 is a fixed-size feature vector for pool reuse.
-type vec14 [D]float32
-
-// vecPool eliminates per-request []float32 allocation.
-var vecPool = sync.Pool{
-	New: func() interface{} { return new(vec14) },
-}
-
-func vectorize(p *Payload, v []float32) {
-	v[0] = clamp(p.Transaction.Amount/maxAmount, 0, 1)
-	v[1] = clamp(float64(p.Transaction.Installments)/maxInstallments, 0, 1)
+func vectorize(p *Payload, v *vec14) {
+	v[0] = q01(p.Transaction.Amount / maxAmount)
+	v[1] = q01(float64(p.Transaction.Installments) / maxInstallments)
 
 	if p.Customer.AvgAmount > 0 {
-		v[2] = clamp((p.Transaction.Amount/p.Customer.AvgAmount)/amtVsAvgRatio, 0, 1)
+		v[2] = q01((p.Transaction.Amount / p.Customer.AvgAmount) / amtVsAvgRatio)
 	} else {
 		v[2] = 0
 	}
 
-	hour, dow, ok := parseRFC3339HourDOW(p.Transaction.RequestedAt)
+	hour, dow, reqMinute, ok := parseRFC3339Parts(p.Transaction.RequestedAt)
 	if ok {
-		v[3] = float32(hour) / 23.0
-		v[4] = float32(dow) / 6.0
-
+		v[3] = q01(float64(hour) / 23.0)
+		v[4] = q01(float64(dow) / 6.0)
 		if p.LastTx != nil {
-			// Full parse only when we need to compute a time difference.
-			t, err := time.Parse(time.RFC3339, p.Transaction.RequestedAt)
-			if err == nil {
-				lastT, err2 := time.Parse(time.RFC3339, p.LastTx.Timestamp)
-				if err2 == nil {
-					mins := t.Sub(lastT).Minutes()
-					if mins < 0 {
-						mins = -mins
-					}
-					v[5] = clamp(mins/maxMinutes, 0, 1)
-				} else {
-					v[5] = -1
+			_, _, lastMinute, lastOK := parseRFC3339Parts(p.LastTx.Timestamp)
+			if lastOK {
+				mins := reqMinute - lastMinute
+				if mins < 0 {
+					mins = -mins
 				}
-				v[6] = clamp(p.LastTx.KmFromCurrent/maxKm, 0, 1)
+				v[5] = q01(float64(mins) / maxMinutes)
+				v[6] = q01(p.LastTx.KmFromCurrent / maxKm)
 			} else {
-				v[5] = -1
-				v[6] = -1
+				v[5] = -scale
+				v[6] = -scale
 			}
 		} else {
-			v[5] = -1
-			v[6] = -1
+			v[5] = -scale
+			v[6] = -scale
 		}
 	} else {
 		v[3] = 0
 		v[4] = 0
-		v[5] = -1
-		v[6] = -1
+		v[5] = -scale
+		v[6] = -scale
 	}
 
-	v[7] = clamp(p.Terminal.KmFromHome/maxKm, 0, 1)
-	v[8] = clamp(float64(p.Customer.TxCount24h)/maxTx24h, 0, 1)
+	v[7] = q01(p.Terminal.KmFromHome / maxKm)
+	v[8] = q01(float64(p.Customer.TxCount24h) / maxTx24h)
 
-	// Explicit zeroing required: pooled slices carry values from prior requests.
 	v[9] = 0
 	if p.Terminal.IsOnline {
-		v[9] = 1
+		v[9] = scale
 	}
 	v[10] = 0
 	if p.Terminal.CardPresent {
-		v[10] = 1
+		v[10] = scale
 	}
 
 	known := false
@@ -283,23 +251,32 @@ func vectorize(p *Payload, v []float32) {
 	}
 	v[11] = 0
 	if !known {
-		v[11] = 1
+		v[11] = scale
 	}
 
 	if risk, ok := mccRisk[p.Merchant.MCC]; ok {
-		v[12] = risk
+		v[12] = q01(risk)
 	} else {
-		v[12] = 0.5
+		v[12] = 5000
 	}
 
-	v[13] = clamp(p.Merchant.AvgAmount/maxMerchantAmt, 0, 1)
+	v[13] = q01(p.Merchant.AvgAmount / maxMerchantAmt)
 }
 
 var json2 = jsoniter.ConfigCompatibleWithStandardLibrary
 
-type Response struct {
-	Approved   bool    `json:"approved"`
-	FraudScore float64 `json:"fraud_score"`
+var responses = [...][]byte{
+	[]byte(`{"approved":true,"fraud_score":0}` + "\n"),
+	[]byte(`{"approved":true,"fraud_score":0.2}` + "\n"),
+	[]byte(`{"approved":true,"fraud_score":0.4}` + "\n"),
+	[]byte(`{"approved":false,"fraud_score":0.6}` + "\n"),
+	[]byte(`{"approved":false,"fraud_score":0.8}` + "\n"),
+	[]byte(`{"approved":false,"fraud_score":1}` + "\n"),
+}
+
+func writeScore(w http.ResponseWriter, fraudCount int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(responses[fraudCount])
 }
 
 func fraudHandler(w http.ResponseWriter, r *http.Request) {
@@ -309,21 +286,18 @@ func fraudHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	vp := vecPool.Get().(*vec14)
-	vectorize(&p, vp[:])
-	fraudCount, total := knnSearch(vp[:])
-	vecPool.Put(vp)
-
-	var fraudScore float64
-	if total > 0 {
-		fraudScore = float64(fraudCount) / float64(total)
+	var v vec14
+	vectorize(&p, &v)
+	score := ruleScore(&v)
+	if score < ambigMin {
+		writeScore(w, 0)
+		return
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(Response{
-		Approved:   fraudScore < THRESHOLD,
-		FraudScore: fraudScore,
-	})
+	if score > ambigMax {
+		writeScore(w, 5)
+		return
+	}
+	writeScore(w, knnSearch(&v))
 }
 
 func loadIndex(path string) error {
@@ -344,34 +318,20 @@ func loadIndex(path string) error {
 		return err
 	}
 
-	if string(mmapData[0:4]) != "VPQU" {
+	if len(mmapData) < 12 || string(mmapData[0:4]) != "RKN4" {
 		log.Fatal("index.bin: wrong magic")
 	}
 	indexN = int(binary.LittleEndian.Uint32(mmapData[4:8]))
-	indexRoot = int32(binary.LittleEndian.Uint32(mmapData[12:16]))
-	indexNNodes = int32(binary.LittleEndian.Uint32(mmapData[16:20]))
-	offset := 20
-
-	N := indexN
-	idxVecs = mmapData[offset : offset+N*D]
-	offset += N * D
-
-	idxLabs = mmapData[offset : offset+N]
-	offset += N
-
-	if offset%4 != 0 {
-		offset += 4 - offset%4
+	dims := int(binary.LittleEndian.Uint32(mmapData[8:12]))
+	if dims != D {
+		log.Fatalf("index.bin: wrong dimension %d", dims)
 	}
 
-	// Non-interleaved node arrays: vp[nn] left[nn] right[nn] thresh[nn]
-	nn := int(indexNNodes)
-	idxVP = unsafe.Slice((*int32)(unsafe.Pointer(&mmapData[offset])), nn)
-	offset += nn * 4
-	idxLeft = unsafe.Slice((*int32)(unsafe.Pointer(&mmapData[offset])), nn)
-	offset += nn * 4
-	idxRight = unsafe.Slice((*int32)(unsafe.Pointer(&mmapData[offset])), nn)
-	offset += nn * 4
-	idxThresh = unsafe.Slice((*float32)(unsafe.Pointer(&mmapData[offset])), nn)
+	offset := 12
+	vecBytes := indexN * D * 2
+	idxVecs = unsafe.Slice((*int16)(unsafe.Pointer(&mmapData[offset])), indexN*D)
+	offset += vecBytes
+	idxLabs = mmapData[offset : offset+indexN]
 
 	return nil
 }
@@ -382,7 +342,7 @@ func loadMCCRisk(path string) error {
 		return err
 	}
 	defer f.Close()
-	var m map[string]float32
+	var m map[string]float64
 	if err := json.NewDecoder(f).Decode(&m); err != nil {
 		return err
 	}
@@ -410,7 +370,7 @@ func main() {
 	if err := loadIndex(indexPath); err != nil {
 		log.Fatalf("load index: %v", err)
 	}
-	log.Printf("Index loaded: N=%d nNodes=%d root=%d", indexN, indexNNodes, indexRoot)
+	log.Printf("Index loaded: ambiguous refs=%d", indexN)
 
 	os.Remove(udsPath)
 	ln, err := net.Listen("unix", udsPath)

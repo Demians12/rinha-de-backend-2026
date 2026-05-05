@@ -88,7 +88,7 @@ git add haproxy.cfg
 git add info.json
 git add participants/
 
-git commit -m "submission: go vptree uds $(date +%Y-%m-%d-%H%M)"
+git commit -m "submission: go rules knn uds $(date +%Y-%m-%d-%H%M)"
 
 git push origin submission --force
 echo "  ✓ Branch submission publicada"

@@ -181,7 +181,7 @@ n = len(lats)
 print(f"""
   ┌───────────────────────────────────────────┐
   │  HTTP over UDS — keep-alive — {N} reqs     │
-  │  Índice: 100 refs (exemplo)               │
+  │  Índice: refs ambíguas do exemplo         │
   ├───────────────────────────────────────────┤
   │  mean    {sum(lats)/n:>7.3f} ms                    │
   │  p50     {lats[n//2]:>7.3f} ms                    │
@@ -189,8 +189,8 @@ print(f"""
   │  p99     {lats[int(n*.99)]:>7.3f} ms                    │
   └───────────────────────────────────────────┘
 
-  ⚠  Este p99 é com 100 refs (dataset de exemplo).
-  Com 3M refs + VP-Tree o p99 real será diferente.
+  ⚠  Este p99 é com o dataset de exemplo.
+  Com 3M refs + índice rules/KNN o p99 real será diferente.
   O número definitivo vem do teste na Rinha (Mac Mini 2014).
 """)
 PYEOF

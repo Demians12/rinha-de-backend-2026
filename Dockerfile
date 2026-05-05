@@ -13,7 +13,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -ldflags="-s -w" -o /bin/healthcheck ./cmd/healthcheck
 
-# Stage 2: Build VP-Tree index from 3M references
+# Stage 2: Build compact rule/KNN fallback index from 3M references
 # Runs at build time — zero startup overhead at runtime
 FROM golang:1.22-alpine AS indexer
 
