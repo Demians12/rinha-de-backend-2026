@@ -52,7 +52,7 @@ services:
       IVF_REPAIR: "0"
       GOGC: "off"
       GOMEMLIMIT: "140MiB"
-      GOMAXPROCS: "1"
+      GOMAXPROCS: "2"
     healthcheck:
       test: ["CMD", "/app/healthcheck", "/sockets/api1.sock"]
       interval: 1s
@@ -71,7 +71,7 @@ services:
       IVF_REPAIR: "0"
       GOGC: "off"
       GOMEMLIMIT: "140MiB"
-      GOMAXPROCS: "1"
+      GOMAXPROCS: "2"
     healthcheck:
       test: ["CMD", "/app/healthcheck", "/sockets/api2.sock"]
       interval: 1s
