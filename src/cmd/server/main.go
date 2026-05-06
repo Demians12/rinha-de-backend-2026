@@ -521,20 +521,23 @@ var (
 )
 
 func fraudHandler(ctx *fasthttp.RequestCtx) {
-	p := payloadPool.Get().(*Payload)
-	defer func() {
-		p.Customer.KnownMerchants = p.Customer.KnownMerchants[:0]
-		p.LastTx = nil
-		payloadPool.Put(p)
-	}()
-
-	if err := json2.Unmarshal(ctx.PostBody(), p); err != nil {
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		return
-	}
-
+	body := ctx.PostBody()
 	var v vec16
-	score := vectorize(p, &v)
+	score, ok := fastVectorize(body, &v)
+	if !ok {
+		// fallback: full JSON parse
+		p := payloadPool.Get().(*Payload)
+		defer func() {
+			p.Customer.KnownMerchants = p.Customer.KnownMerchants[:0]
+			p.LastTx = nil
+			payloadPool.Put(p)
+		}()
+		if err := json2.Unmarshal(body, p); err != nil {
+			ctx.SetStatusCode(fasthttp.StatusBadRequest)
+			return
+		}
+		score = vectorize(p, &v)
+	}
 
 	var fraudCount int
 	if score < ambigMin {
